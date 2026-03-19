@@ -19,6 +19,7 @@
 //use serde::{Deserialize, Serialize};
 //use serde_json::Result;
 // use std::path::PathBuf;
+use chrono::{DateTime, Local};
 use tracing::{debug, error, info, warn};
 // use thiserror::Error;
 // use directories::ProjectDirs;
@@ -62,9 +63,8 @@ use matrix_sdk::{
             OriginalSyncRoomRedactionEvent, RedactedSyncRoomRedactionEvent, SyncRoomRedactionEvent,
         },
         events::{
-            AnyMessageLikeEvent,
-            AnyTimelineEvent,
-            MessageLikeEvent,
+            AnySyncMessageLikeEvent,
+            AnySyncTimelineEvent,
             OriginalSyncMessageLikeEvent,
             // OriginalMessageLikeEvent, // MessageLikeEventContent,
             SyncMessageLikeEvent,
@@ -83,13 +83,63 @@ use matrix_sdk::{
     Client,
 };
 
-/// Declare the items used from main.rs
-use crate::{Error, Output};
+use crate::types::{Error, Output};
+
+/// Format timestamp from milliseconds since Unix epoch to a human-readable local time string
+fn format_ts_millis(ts_ms: u64) -> String {
+    let secs = (ts_ms / 1000) as i64;
+    let nsecs = ((ts_ms % 1000) * 1_000_000) as u32;
+    match DateTime::from_timestamp(secs, nsecs) {
+        Some(dt) => dt.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => ts_ms.to_string(),
+    }
+}
+
+/// Augment a serialized event JSON with extra fields (event_id, sender, origin_server_ts, room_id).
+/// Serializes content once to a string, then injects extra fields via string manipulation
+/// to avoid the overhead of serializing to an intermediate serde_json::Value and then
+/// re-serializing to a string.
+fn augment_event_json<S: serde::Serialize>(
+    content: &S,
+    event_id: &str,
+    sender: &str,
+    origin_server_ts: u64,
+    room_id: &str,
+) -> String {
+    match serde_json::to_string(content) {
+        Ok(json_str) => {
+            if json_str.starts_with('{') {
+                fn escape_json_str(s: &str) -> String {
+                    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
+                }
+                let extra = format!(
+                    "\"event_id\":{},\"sender\":{},\"origin_server_ts\":{},\"room_id\":{},",
+                    escape_json_str(event_id),
+                    escape_json_str(sender),
+                    origin_server_ts,
+                    escape_json_str(room_id),
+                );
+                let mut result = String::with_capacity(json_str.len() + extra.len());
+                result.push('{');
+                result.push_str(&extra);
+                result.push_str(&json_str[1..]);
+                result
+            } else {
+                json_str
+            }
+        }
+        Err(e) => {
+            warn!("augment_event_json: serialization failed: {}", e);
+            e.to_string()
+        }
+    }
+}
 
 /// Lower-level utility function to handle originalsyncmessagelikeevent
 fn handle_originalsyncmessagelikeevent(
     ev: &OriginalSyncMessageLikeEvent<RoomMessageEventContent>,
     room_id: &OwnedRoomId,
+    room_nick: &str,
     context: &Ctx<EvHandlerContext>,
 ) {
     // --output json is handled above this level,
@@ -102,73 +152,58 @@ fn handle_originalsyncmessagelikeevent(
         ev.event_id,
     );
     if context.whoami != ev.sender || context.listen_self {
-        // The compiler knows that it is RoomMessageEventContent, because it comes from room::messages()
-        // print_type_of(&orginialmessagelikeevent.content); // ruma_common::events::room::message::RoomMessageEventContent
+        let sender_nick = ev.sender.localpart();
+        let datetime = format_ts_millis(u64::from(ev.origin_server_ts.0));
+        let event_id_detail = if context.print_event_id {
+            format!(" | {}", ev.event_id)
+        } else {
+            String::new()
+        };
+
         match ev.content.msgtype.to_owned() {
             MessageType::Text(textmessageeventcontent) => {
-                // debug!("Msg of type Text");
-                let TextMessageEventContent {
-                    body,
-                    formatted,
-                    // message,
-                    ..
-                } = textmessageeventcontent;
+                let TextMessageEventContent { body, .. } = textmessageeventcontent;
+                // Match Python format:
+                // Message received for room {room_nick} [{room_id}] | sender {sender_nick} [{sender}] | {datetime} [| {event_id}] | {body}
                 println!(
-                    "Message: type Text: body {:?}, room {:?}, sender {:?}, event id {:?}, formatted {:?}, ",
-                    body, room_id, ev.sender, ev.event_id, formatted,
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
             MessageType::File(filemessageeventcontent) => {
-                // debug!("Msg of type File");
-                let FileMessageEventContent {
-                    body,
-                    filename,
-                    source,
-                    info,
-                    // message,
-                    // file,
-                    ..
-                } = filemessageeventcontent;
+                let FileMessageEventContent { body, .. } = filemessageeventcontent;
                 println!(
-                    "Message: type File: body {:?}, room {:?}, sender {:?}, event id {:?}, filename {:?}, source {:?}, info {:?}",
-                    body, room_id, ev.sender, ev.event_id, filename, source, info,
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
             MessageType::Image(imagemessageeventcontent) => {
-                // debug!("Msg of type File");
-                let ImageMessageEventContent {
-                    body, source, info, ..
-                } = imagemessageeventcontent;
+                let ImageMessageEventContent { body, .. } = imagemessageeventcontent;
                 println!(
-                    "Message: type Image: body {:?}, room {:?}, sender {:?}, event id {:?}, source {:?}, info {:?}",
-                    body, room_id, ev.sender, ev.event_id, source, info,
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
             MessageType::Audio(audiomessageeventcontent) => {
-                // debug!("Msg of type File");
-                let AudioMessageEventContent {
-                    body, source, info, ..
-                } = audiomessageeventcontent;
+                let AudioMessageEventContent { body, .. } = audiomessageeventcontent;
                 println!(
-                    "Message: type Image: body {:?}, room {:?}, sender {:?}, event id {:?}, source {:?}, info {:?}",
-                    body, room_id, ev.sender, ev.event_id, source, info,
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
             MessageType::Video(videomessageeventcontent) => {
-                // debug!("Msg of type File");
-                let VideoMessageEventContent {
-                    body, source, info, ..
-                } = videomessageeventcontent;
+                let VideoMessageEventContent { body, .. } = videomessageeventcontent;
                 println!(
-                    "Message: type Image: body {:?}, room {:?}, sender {:?}, event id {:?}, source {:?}, info {:?}",
-                    body, room_id, ev.sender, ev.event_id, source, info,
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
             _ => {
-                debug!("Not handling this event: {:?}", ev);
-                warn!(
-                    "Not handling this message type. Not implemented yet. {:?}",
-                    ev
+                // Handle all other message types (Emote, Notice, Location, etc.)
+                let body = ev.content.body();
+                println!(
+                    "Message received for room {} [{}] | sender {} [{}] | {}{} | {}",
+                    room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, body,
                 );
             }
         }
@@ -195,30 +230,28 @@ async fn handle_redactedsyncroommessageevent(
     }
     if !context.output.is_text() {
         // Serialize it to a JSON string.
-        let j = match serde_json::to_string(&ev.content) {
-            Ok(jsonstr) => {
-                // this event does not contain the room_id, other events do.
-                // People are missing the room_id in output.
-                // Nasty hack: inserting the room_id into the JSON string.
-                let mut s = jsonstr;
-                s.insert_str(s.len() - 1, ",\"event_id\":\"\"");
-                s.insert_str(s.len() - 2, ev.event_id.as_str());
-                s.insert_str(s.len() - 1, ",\"sender\":\"\"");
-                s.insert_str(s.len() - 2, ev.sender.as_str());
-                s.insert_str(s.len() - 1, ",\"origin_server_ts\":\"\"");
-                s.insert_str(s.len() - 2, &ev.origin_server_ts.0.to_string());
-                s.insert_str(s.len() - 1, ",\"room_id\":\"\"");
-                s.insert_str(s.len() - 2, room.room_id().as_str());
-                s
-            }
-            Err(e) => e.to_string(),
-        };
+        let j = augment_event_json(
+            &ev.content, ev.event_id.as_str(), ev.sender.as_str(),
+            u64::from(ev.origin_server_ts.0), room.room_id().as_str(),
+        );
         println!("{}", j);
         return;
     }
-    debug!(
-        "Received a message for RedactedSyncRoomMessageEvent. Not implemented yet for text format, try --output json. {:?}",
-        ev
+    // Text format for redacted messages, matching Python's RedactedEvent format
+    let room_id = room.room_id();
+    let room_nick = room.cached_display_name()
+        .map(|dn| dn.to_string())
+        .unwrap_or_default();
+    let sender_nick = ev.sender.localpart();
+    let datetime = format_ts_millis(u64::from(ev.origin_server_ts.0));
+    let event_id_detail = if context.print_event_id {
+        format!(" | {}", ev.event_id)
+    } else {
+        String::new()
+    };
+    println!(
+        "Message received for room {} [{}] | sender {} [{}] | {}{} | Received redacted event: sender: {}",
+        room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail, ev.sender,
     );
 }
 
@@ -227,25 +260,10 @@ fn handle_originalsyncroomredactionevent(ev: OriginalSyncRoomRedactionEvent, roo
         "Received a message for OriginalSyncRoomRedactionEvent. {:?}",
         ev
     );
-    // Serialize it to a JSON string.
-    let j = match serde_json::to_string(&ev.content) {
-        Ok(jsonstr) => {
-            // this event does not contain the room_id, other events do.
-            // People are missing the room_id in output.
-            // Nasty hack: inserting the room_id into the JSON string.
-            let mut s = jsonstr;
-            s.insert_str(s.len() - 1, ",\"event_id\":\"\"");
-            s.insert_str(s.len() - 2, ev.event_id.as_str());
-            s.insert_str(s.len() - 1, ",\"sender\":\"\"");
-            s.insert_str(s.len() - 2, ev.sender.as_str());
-            s.insert_str(s.len() - 1, ",\"origin_server_ts\":\"\"");
-            s.insert_str(s.len() - 2, &ev.origin_server_ts.0.to_string());
-            s.insert_str(s.len() - 1, ",\"room_id\":\"\"");
-            s.insert_str(s.len() - 2, room.room_id().as_str());
-            s
-        }
-        Err(e) => e.to_string(),
-    };
+    let j = augment_event_json(
+        &ev.content, ev.event_id.as_str(), ev.sender.as_str(),
+        u64::from(ev.origin_server_ts.0), room.room_id().as_str(),
+    );
     println!("{}", j);
 }
 
@@ -254,25 +272,10 @@ fn handle_redactedsyncroomredactionevent(ev: RedactedSyncRoomRedactionEvent, roo
         "Received a message for RedactedSyncRoomRedactionEvent. {:?}",
         ev
     );
-    // Serialize it to a JSON string.
-    let j = match serde_json::to_string(&ev.content) {
-        Ok(jsonstr) => {
-            // this event does not contain the room_id, other events do.
-            // People are missing the room_id in output.
-            // Nasty hack: inserting the room_id into the JSON string.
-            let mut s = jsonstr;
-            s.insert_str(s.len() - 1, ",\"event_id\":\"\"");
-            s.insert_str(s.len() - 2, ev.event_id.as_str());
-            s.insert_str(s.len() - 1, ",\"sender\":\"\"");
-            s.insert_str(s.len() - 2, ev.sender.as_str());
-            s.insert_str(s.len() - 1, ",\"origin_server_ts\":\"\"");
-            s.insert_str(s.len() - 2, &ev.origin_server_ts.0.to_string());
-            s.insert_str(s.len() - 1, ",\"room_id\":\"\"");
-            s.insert_str(s.len() - 2, room.room_id().as_str());
-            s
-        }
-        Err(e) => e.to_string(),
-    };
+    let j = augment_event_json(
+        &ev.content, ev.event_id.as_str(), ev.sender.as_str(),
+        u64::from(ev.origin_server_ts.0), room.room_id().as_str(),
+    );
     println!("{}", j);
 }
 
@@ -301,13 +304,26 @@ async fn handle_syncroomredactedevent(
         }
         return;
     }
-    debug!(
-        "Received a message for SyncRoomRedactionEvent. Not implemented yet for text format, try --output json. {:?}",
-        ev
+    // Text format for redaction events, matching Python's RedactionEvent format
+    let room_id = room.room_id();
+    let room_nick = room.cached_display_name()
+        .map(|dn| dn.to_string())
+        .unwrap_or_default();
+    let sender_nick = ev.sender().localpart();
+    let datetime = format_ts_millis(u64::from(ev.origin_server_ts().0));
+    let event_id_detail = if context.print_event_id {
+        format!(" | {}", ev.event_id())
+    } else {
+        String::new()
+    };
+    println!(
+        "Message received for room {} [{}] | sender {} [{}] | {}{} | Received redaction event: sender: {}",
+        room_nick, room_id, sender_nick, ev.sender(), datetime, event_id_detail, ev.sender(),
     );
 }
 
 /// Utility function to handle SyncRoomEncryptedEvent events.
+/// These fire when an encrypted message could not be decrypted by matrix-sdk.
 // None of the args can be borrowed because this function is passed into a spawned process.
 async fn handle_syncroomencryptedevent(
     ev: SyncRoomEncryptedEvent,
@@ -321,29 +337,39 @@ async fn handle_syncroomencryptedevent(
         return;
     }
     match ev {
-        SyncMessageLikeEvent::Original(orginialmessagelikeevent) => {
-            debug!(
-                "New message: {:?} from sender {:?}, room {:?}, event_id {:?}",
-                orginialmessagelikeevent.content,
-                orginialmessagelikeevent.sender,
-                room.room_id(), // "<unknown>", // ev does not contain room!
-                orginialmessagelikeevent.event_id,
+        SyncMessageLikeEvent::Original(original_ev) => {
+            if !context.output.is_text() {
+                let j = augment_event_json(
+                    &original_ev.content, original_ev.event_id.as_str(), original_ev.sender.as_str(),
+                    u64::from(original_ev.origin_server_ts.0), room.room_id().as_str(),
+                );
+                println!("{}", j);
+                return;
+            }
+            let room_id = room.room_id();
+            let room_nick = room.cached_display_name()
+                .map(|dn| dn.to_string())
+                .unwrap_or_default();
+            let sender_nick = original_ev.sender.localpart();
+            let datetime = format_ts_millis(u64::from(original_ev.origin_server_ts.0));
+            let event_id_detail = if context.print_event_id {
+                format!(" | {}", original_ev.event_id)
+            } else {
+                String::new()
+            };
+            println!(
+                "Message received for room {} [{}] | sender {} [{}] | {}{} | Encrypted message could not be decrypted",
+                room_nick, room_id, sender_nick, original_ev.sender, datetime, event_id_detail,
             );
-            // let jroom = join_room();
-            // let _res = jroom.decrypt_event(&ev).await?;
-            // Todo: attempt to decrypt msg
         }
         _ => {
-            debug!(
-                "Received a message for RedactedSyncMessageLikeEvent. Not implemented yet. {:?}",
-                ev
-            );
+            debug!("Received redacted encrypted event, skipping: {:?}", ev);
         }
     }
-    warn!("Decryption attempt not implemented yet.");
 }
 
 /// Utility function to handle OriginalSyncRoomEncryptedEvent events.
+/// These fire when an encrypted message could not be decrypted by matrix-sdk.
 // None of the args can be borrowed because this function is passed into a spawned process.
 async fn handle_originalsyncroomencryptedevent(
     ev: OriginalSyncRoomEncryptedEvent,
@@ -356,17 +382,29 @@ async fn handle_originalsyncroomencryptedevent(
         debug!("Skipping message from itself because --listen-self is not set.");
         return;
     }
-    debug!(
-        "New message: {:?} from sender {:?}, room {:?}, event_id {:?}",
-        ev.content,
-        ev.sender,
-        room.room_id(), // "<unknown>", // ev does not contain room!
-        ev.event_id,
+    if !context.output.is_text() {
+        let j = augment_event_json(
+            &ev.content, ev.event_id.as_str(), ev.sender.as_str(),
+            u64::from(ev.origin_server_ts.0), room.room_id().as_str(),
+        );
+        println!("{}", j);
+        return;
+    }
+    let room_id = room.room_id();
+    let room_nick = room.cached_display_name()
+        .map(|dn| dn.to_string())
+        .unwrap_or_default();
+    let sender_nick = ev.sender.localpart();
+    let datetime = format_ts_millis(u64::from(ev.origin_server_ts.0));
+    let event_id_detail = if context.print_event_id {
+        format!(" | {}", ev.event_id)
+    } else {
+        String::new()
+    };
+    println!(
+        "Message received for room {} [{}] | sender {} [{}] | {}{} | Encrypted message could not be decrypted",
+        room_nick, room_id, sender_nick, ev.sender, datetime, event_id_detail,
     );
-    // let jroom = join_room();
-    // let _res = jroom.decrypt_event(&ev).await?;
-    // Todo: attempt to decrypt msg
-    warn!("Decryption attempt not implemented yet.");
 }
 
 /// Utility function to handle SyncRoomMessageEvent events.
@@ -385,41 +423,47 @@ async fn handle_syncroommessageevent(
     match ev {
         SyncMessageLikeEvent::Original(orginialmessagelikeevent) => {
             if !context.output.is_text() {
-                // Serialize it to a JSON string.
-                let j = match serde_json::to_string(&orginialmessagelikeevent.content) {
-                    Ok(jsonstr) => {
-                        // this event does not contain the room_id, other events do.
-                        // People are missing the room_id in output.
-                        // Nasty hack: inserting the room_id into the JSON string.
-                        let mut s = jsonstr;
-                        s.insert_str(s.len() - 1, ",\"event_id\":\"\"");
-                        s.insert_str(s.len() - 2, orginialmessagelikeevent.event_id.as_str());
-                        s.insert_str(s.len() - 1, ",\"sender\":\"\"");
-                        s.insert_str(s.len() - 2, orginialmessagelikeevent.sender.as_str());
-                        s.insert_str(s.len() - 1, ",\"origin_server_ts\":\"\"");
-                        s.insert_str(
-                            s.len() - 2,
-                            &orginialmessagelikeevent.origin_server_ts.0.to_string(),
-                        );
-                        s.insert_str(s.len() - 1, ",\"room_id\":\"\"");
-                        s.insert_str(s.len() - 2, room.room_id().as_str());
-                        s
-                    }
-                    Err(e) => e.to_string(),
-                };
+                let j = augment_event_json(
+                    &orginialmessagelikeevent.content, orginialmessagelikeevent.event_id.as_str(),
+                    orginialmessagelikeevent.sender.as_str(),
+                    u64::from(orginialmessagelikeevent.origin_server_ts.0), room.room_id().as_str(),
+                );
                 println!("{}", j);
                 return;
             }
+            let room_nick = room.cached_display_name()
+                .map(|dn| dn.to_string())
+                .unwrap_or_default();
             handle_originalsyncmessagelikeevent(
                 &orginialmessagelikeevent,
                 &RoomId::parse(room.room_id()).unwrap(),
+                &room_nick,
                 &context,
             );
         }
-        _ => {
-            debug!(
-                "Received a message for RedactedSyncMessageLikeEvent. Not implemented yet. {:?}",
-                ev
+        SyncMessageLikeEvent::Redacted(redacted) => {
+            if !context.output.is_text() {
+                let j = augment_event_json(
+                    &redacted.content, redacted.event_id.as_str(), redacted.sender.as_str(),
+                    u64::from(redacted.origin_server_ts.0), room.room_id().as_str(),
+                );
+                println!("{}", j);
+                return;
+            }
+            let room_id = room.room_id();
+            let room_nick = room.cached_display_name()
+                .map(|dn| dn.to_string())
+                .unwrap_or_default();
+            let sender_nick = redacted.sender.localpart();
+            let datetime = format_ts_millis(u64::from(redacted.origin_server_ts.0));
+            let event_id_detail = if context.print_event_id {
+                format!(" | {}", redacted.event_id)
+            } else {
+                String::new()
+            };
+            println!(
+                "Message received for room {} [{}] | sender {} [{}] | {}{} | Received redacted event: sender: {}",
+                room_nick, room_id, sender_nick, redacted.sender, datetime, event_id_detail, redacted.sender,
             );
         }
     };
@@ -431,6 +475,7 @@ struct EvHandlerContext {
     whoami: OwnedUserId,
     listen_self: bool,
     output: Output,
+    print_event_id: bool,
 }
 
 /// Listen to all rooms once. Then continue.
@@ -439,6 +484,7 @@ pub(crate) async fn listen_once(
     listen_self: bool, // listen to my own messages?
     whoami: OwnedUserId,
     output: Output,
+    print_event_id: bool,
 ) -> Result<(), Error> {
     info!(
         "mclient::listen_once(): listen_self {}, room {}",
@@ -449,6 +495,7 @@ pub(crate) async fn listen_once(
         whoami,
         listen_self,
         output,
+        print_event_id,
     };
 
     client.add_event_handler_context(context.clone());
@@ -456,7 +503,7 @@ pub(crate) async fn listen_once(
     // Todo: print events nicely and filter by --listen-self
     client.add_event_handler(|ev: SyncRoomMessageEvent, room: Room,
         client: Client, context: Ctx<EvHandlerContext>| async move {
-        tokio::spawn(handle_syncroommessageevent(ev, room, client, context));
+        handle_syncroommessageevent(ev, room, client, context).await;
     });
 
     client.add_event_handler(
@@ -464,9 +511,9 @@ pub(crate) async fn listen_once(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_redactedsyncroommessageevent(
+            handle_redactedsyncroommessageevent(
                 ev, room, client, context,
-            ));
+            ).await;
         },
     );
 
@@ -475,7 +522,7 @@ pub(crate) async fn listen_once(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_syncroomredactedevent(ev, room, client, context));
+            handle_syncroomredactedevent(ev, room, client, context).await;
         },
     );
 
@@ -484,9 +531,9 @@ pub(crate) async fn listen_once(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_originalsyncroomencryptedevent(
+            handle_originalsyncroomencryptedevent(
                 ev, room, client, context,
-            ));
+            ).await;
         },
     );
 
@@ -495,7 +542,7 @@ pub(crate) async fn listen_once(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_syncroomencryptedevent(ev, room, client, context));
+            handle_syncroomencryptedevent(ev, room, client, context).await;
         },
     );
 
@@ -516,6 +563,7 @@ pub(crate) async fn listen_forever(
     listen_self: bool, // listen to my own messages?
     whoami: OwnedUserId,
     output: Output,
+    print_event_id: bool,
 ) -> Result<(), Error> {
     info!(
         "mclient::listen_forever(): listen_self {}, room {}",
@@ -526,6 +574,7 @@ pub(crate) async fn listen_forever(
         whoami,
         listen_self,
         output,
+        print_event_id,
     };
 
     client.add_event_handler_context(context.clone());
@@ -533,12 +582,12 @@ pub(crate) async fn listen_forever(
     // Todo: print events nicely and filter by --listen-self
     client.add_event_handler(
         |ev: SyncRoomMessageEvent, room: Room, client: Client, context: Ctx<EvHandlerContext>| async move {
-        tokio::spawn(handle_syncroommessageevent(ev, room, client, context));
+        handle_syncroommessageevent(ev, room, client, context).await;
     });
 
     client.add_event_handler(
         |ev: SyncRoomEncryptedEvent, room: Room, client: Client, context: Ctx<EvHandlerContext>| async move {
-        tokio::spawn(handle_syncroomencryptedevent(ev, room, client, context));
+        handle_syncroomencryptedevent(ev, room, client, context).await;
     });
 
     client.add_event_handler(
@@ -546,9 +595,9 @@ pub(crate) async fn listen_forever(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_originalsyncroomencryptedevent(
+            handle_originalsyncroomencryptedevent(
                 ev, room, client, context,
-            ));
+            ).await;
         },
     );
 
@@ -557,15 +606,15 @@ pub(crate) async fn listen_forever(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_redactedsyncroommessageevent(
+            handle_redactedsyncroommessageevent(
                 ev, room, client, context,
-            ));
+            ).await;
         },
     );
 
     client.add_event_handler(|ev: SyncRoomRedactionEvent,
             room: Room, client: Client, context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_syncroomredactedevent(ev, room, client, context));
+            handle_syncroomredactedevent(ev, room, client, context).await;
         });
 
     // go into event loop to sync and to execute verify protocol
@@ -602,6 +651,7 @@ pub(crate) async fn listen_tail(
     listen_self: bool,       // listen to my own messages?
     whoami: OwnedUserId,
     output: Output,
+    print_event_id: bool,
 ) -> Result<(), Error> {
     info!(
         "mclient::listen_tail(): listen_self {}, roomnames {:?}",
@@ -657,17 +707,20 @@ pub(crate) async fn listen_tail(
         whoami: whoami.clone(),
         listen_self,
         output,
+        print_event_id,
     };
     let ctx = Ctx(context);
 
-    let mut err_count = 0u32;
     for roomid in roomids.iter() {
         let mut options = MessagesOptions::backward(); // .from("t47429-4392820_219380_26003_2265");
-        options.limit = UInt::new(number).unwrap();
-        let jroom = client.get_room(roomid.clone().as_ref()).unwrap();
+        options.limit = UInt::new(number).ok_or(Error::InvalidRoom)?;
+        let jroom = client.get_room(roomid.clone().as_ref()).ok_or(Error::InvalidRoom)?;
         let msgs = jroom.messages(options).await;
         // debug!("\n\nmsgs = {:?} \n\n", msgs);
-        let chunk = msgs.unwrap().chunk;
+        let chunk = msgs.map_err(|e| {
+            error!("Failed to get messages: {}", e);
+            Error::ListenFailed
+        })?.chunk;
         for index in 0..chunk.len() {
             debug!(
                 "processing message {:?} out of {:?}",
@@ -677,87 +730,123 @@ pub(crate) async fn listen_tail(
             let anytimelineevent = &chunk[chunk.len() - 1 - index]; // reverse ordering, getting older msg first
                                                                     // Todo : dump the JSON serialized string via Json API
 
-            let rawevent: AnyTimelineEvent = anytimelineevent.event.deserialize().unwrap();
-            // print_type_of(&rawevent); // ruma_common::events::enums::AnyTimelineEvent
-            debug!("rawevent = value is {:?}\n", rawevent);
-            // rawevent = Ok(MessageLike(RoomMessage(Original(OriginalMessageLikeEvent { content: RoomMessageEventContent {
-            // msgtype: Text(TextMessageEventContent { body: "54", formatted: None }), relates_to: Some(_Custom) }, event_id: "$xxx", sender: "@u:some.homeserver.org", origin_server_ts: MilliSecondsSinceUnixEpoch(123), room_id: "!rrr:some.homeserver.org", unsigned: MessageLikeUnsigned { age: Some(123), transaction_id: None, relations: None } }))))
             if !output.is_text() {
-                println!("{}", anytimelineevent.event.json());
+                // JSON output mode: skip full deserialization, just print raw JSON.
+                // Extract only the sender field for self-filtering using a minimal struct
+                // instead of parsing the entire JSON into serde_json::Value.
+                #[derive(serde::Deserialize)]
+                struct SenderOnly {
+                    #[serde(default)]
+                    sender: Option<String>,
+                }
+                let raw_json = anytimelineevent.raw().json();
+                let is_self = serde_json::from_str::<SenderOnly>(raw_json.get())
+                    .ok()
+                    .and_then(|s| s.sender)
+                    .map(|s| s == whoami.as_str())
+                    .unwrap_or(false);
+                if listen_self || !is_self {
+                    println!("{}", raw_json);
+                }
                 continue;
             }
 
+            let rawevent: AnySyncTimelineEvent = match anytimelineevent.raw().deserialize() {
+                Ok(ev) => ev,
+                Err(e) => {
+                    error!("Failed to deserialize timeline event: {}", e);
+                    continue;
+                }
+            };
+            // print_type_of(&rawevent); // ruma_common::events::enums::AnyTimelineEvent
+            debug!("rawevent = value is {:?}\n", rawevent);
+
             match rawevent {
-                AnyTimelineEvent::MessageLike(anymessagelikeevent) => {
+                AnySyncTimelineEvent::MessageLike(anymessagelikeevent) => {
                     debug!("value: {:?}", anymessagelikeevent);
                     match anymessagelikeevent {
-                        AnyMessageLikeEvent::RoomMessage(messagelikeevent) => {
+                        AnySyncMessageLikeEvent::RoomMessage(messagelikeevent) => {
                             debug!("value: {:?}", messagelikeevent);
                             match messagelikeevent {
-                                MessageLikeEvent::Original(orginialmessagelikeevent) => {
-                                    let room_id = orginialmessagelikeevent.room_id.clone();
-                                    let orginialsyncmessagelikeevent =
-                                        OriginalSyncMessageLikeEvent::from(
-                                            orginialmessagelikeevent,
-                                        );
+                                SyncMessageLikeEvent::Original(orginialmessagelikeevent) => {
+                                    let room_id = roomid.clone();
+                                    let room_nick = jroom.cached_display_name()
+                                        .map(|dn| dn.to_string())
+                                        .unwrap_or_default();
                                     handle_originalsyncmessagelikeevent(
-                                        &orginialsyncmessagelikeevent,
+                                        &orginialmessagelikeevent,
                                         &room_id,
+                                        &room_nick,
                                         &ctx,
                                     );
                                 }
-                                _ => {
-                                    warn!("RoomMessage type is not handled. Not implemented yet.");
-                                    err_count += 1;
+                                SyncMessageLikeEvent::Redacted(redacted) => {
+                                    let room_nick = jroom.cached_display_name()
+                                        .map(|dn| dn.to_string())
+                                        .unwrap_or_default();
+                                    let sender_nick = redacted.sender.localpart();
+                                    let datetime = format_ts_millis(u64::from(redacted.origin_server_ts.0));
+                                    let event_id_detail = if print_event_id {
+                                        format!(" | {}", redacted.event_id)
+                                    } else {
+                                        String::new()
+                                    };
+                                    println!(
+                                        "Message received for room {} [{}] | sender {} [{}] | {}{} | Received redacted event: sender: {}",
+                                        room_nick, roomid, sender_nick, redacted.sender, datetime, event_id_detail, redacted.sender,
+                                    );
                                 }
                             }
                         }
-                        AnyMessageLikeEvent::RoomEncrypted(messagelikeevent) => {
-                            warn!(
+                        AnySyncMessageLikeEvent::RoomEncrypted(messagelikeevent) => {
+                            debug!(
                                 "Event of type RoomEncrypted received: {:?}",
                                 messagelikeevent
                             );
-                            // messagelikeevent is something like
-                            // RoomEncrypted: Original(OriginalMessageLikeEvent { content: RoomEncryptedEventContent { scheme: MegolmV1AesSha2(MegolmV1AesSha2Content { ciphertext: "xxx", sender_key: "yyy", device_id: "DDD", session_id: "sss" }), relates_to: Some(_Custom) }, event_id: "$eee", sender: "@sss:some.homeserver.org", origin_server_ts: MilliSecondsSinceUnixEpoch(123), room_id: "!roomid:some.homeserver.org",
-                            //      unsigned: MessageLikeUnsigned { age: Some(123), transaction_id: None, relations: None } })
-                            // Cannot be decryoted with jroom.decrypt_event(&anytimelineevent.event).await?;
-                            // because decrypt_event() only decrypts events from sync() and not from messages()
-
-                            match messagelikeevent {
-                                MessageLikeEvent::Original(orginialmessagelikeevent) => {
-                                    debug!(
-                                    "New message: {:?} from sender {:?}, room {:?}, event_id {:?}",
-                                    orginialmessagelikeevent.content,
-                                    orginialmessagelikeevent.sender,
-                                    orginialmessagelikeevent.room_id,
-                                    orginialmessagelikeevent.event_id,
+                            // Cannot be decrypted with jroom.decrypt_event() for messages()
+                            // (only works for sync events). Print readable output.
+                            let sender = messagelikeevent.sender();
+                            if whoami != *sender || listen_self {
+                                let room_nick = jroom.cached_display_name()
+                                    .map(|dn| dn.to_string())
+                                    .unwrap_or_default();
+                                let sender_nick = sender.localpart();
+                                let datetime = format_ts_millis(u64::from(messagelikeevent.origin_server_ts().0));
+                                let event_id_detail = if print_event_id {
+                                    format!(" | {}", messagelikeevent.event_id())
+                                } else {
+                                    String::new()
+                                };
+                                println!(
+                                    "Message received for room {} [{}] | sender {} [{}] | {}{} | Encrypted message could not be decrypted",
+                                    room_nick, roomid, sender_nick, sender, datetime, event_id_detail,
                                 );
-                                    if whoami != orginialmessagelikeevent.sender || listen_self {
-                                        // The compiler knows that it is RoomMessageEventContent, because it comes from room::messages()
-                                        // print_type_of(&orginialmessagelikeevent.content); // ruma_common::events::room::message::RoomEncryptedEventContent
-                                        println!(
-                                            "Message: type Encrypted: body {:?}, room {:?}, sender {:?}, event_id {:?}, message could not be decrypted",
-                                            orginialmessagelikeevent.content, orginialmessagelikeevent.room_id, orginialmessagelikeevent.sender, orginialmessagelikeevent.event_id,
-                                        );
-                                        // has orginialmessagelikeevent.content.relates_to.unwrap()
-                                    } else {
-                                        debug!("Skipping message from itself because --listen-self is not set.");
-                                    }
-                                }
-                                _ => {
-                                    warn!("RoomMessage type is not handled. Not implemented yet.");
-                                    err_count += 1;
-                                }
+                            } else {
+                                debug!("Skipping message from itself because --listen-self is not set.");
                             }
                         }
-                        AnyMessageLikeEvent::RoomRedaction(messagelikeevent) => {
-                            warn!("Event of type RoomRedaction received. Not implemented yet. value: {:?}", messagelikeevent);
-                            err_count += 1;
+                        AnySyncMessageLikeEvent::RoomRedaction(messagelikeevent) => {
+                            let sender = messagelikeevent.sender();
+                            if whoami != *sender || listen_self {
+                                let room_nick = jroom.cached_display_name()
+                                    .map(|dn| dn.to_string())
+                                    .unwrap_or_default();
+                                let sender_nick = sender.localpart();
+                                let datetime = format_ts_millis(u64::from(messagelikeevent.origin_server_ts().0));
+                                let event_id_detail = if print_event_id {
+                                    format!(" | {}", messagelikeevent.event_id())
+                                } else {
+                                    String::new()
+                                };
+                                println!(
+                                    "Message received for room {} [{}] | sender {} [{}] | {}{} | Received redaction event: sender: {}",
+                                    room_nick, roomid, sender_nick, sender, datetime, event_id_detail, sender,
+                                );
+                            }
                         }
-                        // and many more
                         _ => {
-                            warn!("MessageLike type is not handle. Not implemented yet.");
-                            err_count += 1;
+                            // Other MessageLike events (reactions, stickers, etc.)
+                            debug!("Received other MessageLike event type, skipping: {:?}", anymessagelikeevent);
                         }
                     }
                 }
@@ -765,11 +854,7 @@ pub(crate) async fn listen_tail(
             }
         }
     }
-    if err_count != 0 {
-        Err(Error::NotImplementedYet)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Listen to some specified rooms once, then go on.
@@ -781,6 +866,7 @@ pub(crate) async fn listen_all(
     listen_self: bool,       // listen to my own messages?
     whoami: OwnedUserId,
     output: Output,
+    print_event_id: bool,
 ) -> Result<(), Error> {
     if roomnames.is_empty() {
         return Err(Error::MissingRoom);
@@ -794,13 +880,14 @@ pub(crate) async fn listen_all(
         whoami,
         listen_self,
         output,
+        print_event_id,
     };
 
     client.add_event_handler_context(context.clone());
 
     // Todo: print events nicely and filter by --listen-self
     client.add_event_handler(|ev: SyncRoomMessageEvent, room: Room, client: Client, context: Ctx<EvHandlerContext>| async move {
-        tokio::spawn(handle_syncroommessageevent(ev, room, client, context));
+        handle_syncroommessageevent(ev, room, client, context).await;
     });
 
     // this seems idential to SyncRoomMessageEvent and hence a duplicate
@@ -818,15 +905,15 @@ pub(crate) async fn listen_all(
          room: Room,
          client: Client,
          context: Ctx<EvHandlerContext>| async move {
-            tokio::spawn(handle_redactedsyncroommessageevent(
+            handle_redactedsyncroommessageevent(
                 ev, room, client, context,
-            ));
+            ).await;
         },
     );
 
     client.add_event_handler(|ev: SyncRoomRedactionEvent,
         room: Room, client: Client, context: Ctx<EvHandlerContext>| async move {
-        tokio::spawn(handle_syncroomredactedevent(ev, room, client, context));
+        handle_syncroomredactedevent(ev, room, client, context).await;
     });
 
     // go into event loop to sync and to execute verify protocol
